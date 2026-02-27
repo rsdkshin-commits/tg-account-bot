@@ -230,38 +230,15 @@ async def telegram_webhook(request: Request):
         await tg_send_message(chat_id, "🧹 已清空（前數/手動/回數）")
         return {"ok": True}
 
-    if text == "匯出":
-        if not PUBLIC_BASE_URL:
-            await tg_send_message(chat_id, "⚠️ 尚未設定 PUBLIC_BASE_URL（請到 Render Environment 填入你的網址）")
-            return {"ok": True}
-
-        # 不帶 key（你要自己輸入 ADMIN_KEY）
-        # 這裡提供：
-        # 1) 後台網址（可手選日期時間）
-        # 2) 直接下載網址（預設過去30天）
-        end_dt = datetime.now()
-        start_dt = end_dt - timedelta(days=30)
-
-        admin_url_no_key = f"{PUBLIC_BASE_URL}/admin?chat_id={chat_id}"
-        download_url_no_key = (
-            f"{PUBLIC_BASE_URL}/admin/export?"
-            f"chat_id={chat_id}"
-            f"&start={start_dt.strftime('%Y-%m-%d %H:%M:%S')}"
-            f"&end={end_dt.strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-
-        await tg_send_message(
-            chat_id,
-            "🖥 後台（可手選日期/時間到秒）\n"
-            f"{admin_url_no_key}\n\n"
-            "📄 直接下載（預設過去30天）\n"
-            f"{download_url_no_key}\n\n"
-            "🔐 以上網址都需要你自己加上 key：\n"
-            "後台：在網址最後加 &key=你的ADMIN_KEY\n"
-            "下載：在網址最後加 &key=你的ADMIN_KEY"
-        )
+   if text == "匯出":
+    if not PUBLIC_BASE_URL:
+        await tg_send_message(chat_id, "⚠️ 尚未設定 PUBLIC_BASE_URL")
         return {"ok": True}
 
+    # 只回一行網址，讓你自己輸入 key
+    url = f"{PUBLIC_BASE_URL}/admin?chat_id={chat_id}&key="
+
+    await tg_send_message(chat_id, url)
     return {"ok": True}
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -409,3 +386,4 @@ async def setup_webhook(key: str):
             raise HTTPException(status_code=500, detail=str(data))
 
     return RedirectResponse(url=f"/admin?key={key}")
+
