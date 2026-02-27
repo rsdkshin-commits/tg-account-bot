@@ -1,5 +1,5 @@
 import os, json
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 
 import httpx
@@ -56,7 +56,7 @@ def add_log(chat_id: int, chat_name: str, user: str, kind: str, amount: float):
         "time": datetime.now().isoformat(timespec="seconds"),
         "user": user,
         "kind": kind,     # 前數 / 手動 / 回數 / 清空
-        "amount": amount,
+        "amount": round(float(amount), 2),
         "chat_id": chat_id,
         "chat_name": chat_name,
     })
@@ -83,7 +83,8 @@ def require_admin(key: str):
         raise HTTPException(status_code=403, detail="Forbidden")
 
 def parse_dt(s: str) -> datetime:
-    """Support:
+    """
+    Support:
     1) YYYY-MM-DD HH:MM:SS
     2) YYYY-MM-DDTHH:MM
     3) YYYY-MM-DDTHH:MM:SS
@@ -95,6 +96,9 @@ def parse_dt(s: str) -> datetime:
         except ValueError:
             pass
     raise ValueError("Bad datetime format")
+
+def fmt2(x: float) -> str:
+    return f"{float(x):.2f}"
 
 # ---------------- Excel export (含餘額) ----------------
 def export_excel(chat_id: int, start_dt: datetime, end_dt: datetime) -> Optional[str]:
@@ -114,18 +118,18 @@ def export_excel(chat_id: int, start_dt: datetime, end_dt: datetime) -> Optional
     rows = []
     for t, log in parsed:
         kind = str(log.get("kind", ""))
-        amount = float(log.get("amount", 0.0))
+        amount = round(float(log.get("amount", 0.0)), 2)
 
         if kind == "前數":
-            running_front += amount
+            running_front = round(running_front + amount, 2)
         elif kind == "手動":
-            running_manual += amount
+            running_manual = round(running_manual + amount, 2)
         elif kind == "回數":
-            running_ret += amount
+            running_ret = round(running_ret + amount, 2)
         elif kind == "清空":
             running_front = running_manual = running_ret = 0.0
 
-        balance = running_front + running_manual - running_ret
+        balance = round(running_front + running_manual - running_ret, 2)
 
         if start_dt <= t <= end_dt:
             rows.append({
@@ -185,44 +189,57 @@ async def telegram_webhook(request: Request):
         except Exception:
             return None
 
+    # 前=
     if text.startswith("前="):
         amount = parse_amount("前=")
         if amount is None:
             await tg_send_message(chat_id, "❌ 格式：前=100")
             return {"ok": True}
-        st["front"] += amount
+
+        st["front"] = round(float(st["front"]) + float(amount), 2)
         add_log(chat_id, chat_name, user, "前數", amount)
-        await tg_send_message(chat_id, f"✅ 前數={st['front']}")
+        await tg_send_message(chat_id, f"✅ 前數={fmt2(st['front'])}")
         return {"ok": True}
 
+    # 手=
     if text.startswith("手="):
         amount = parse_amount("手=")
         if amount is None:
             await tg_send_message(chat_id, "❌ 格式：手=100")
             return {"ok": True}
-        st["manual"] += amount
+
+        st["manual"] = round(float(st["manual"]) + float(amount), 2)
         add_log(chat_id, chat_name, user, "手動", amount)
-        await tg_send_message(chat_id, f"✅ 手動={st['manual']}")
+        await tg_send_message(chat_id, f"✅ 手動={fmt2(st['manual'])}")
         return {"ok": True}
 
+    # 回=
     if text.startswith("回="):
         amount = parse_amount("回=")
         if amount is None:
             await tg_send_message(chat_id, "❌ 格式：回=100")
             return {"ok": True}
-        st["ret"] += amount
+
+        st["ret"] = round(float(st["ret"]) + float(amount), 2)
         add_log(chat_id, chat_name, user, "回數", amount)
-        await tg_send_message(chat_id, f"✅ 回數={st['ret']}")
+        await tg_send_message(chat_id, f"✅ 回數={fmt2(st['ret'])}")
         return {"ok": True}
 
+    # 總計
     if text == "總計":
-        balance = st["front"] + st["manual"] - st["ret"]
+        balance = round(float(st["front"]) + float(st["manual"]) - float(st["ret"]), 2)
         await tg_send_message(
             chat_id,
-            f"📊 本群統計\n前數：{st['front']}\n手動：{st['manual']}\n回數：{st['ret']}\n—\n💰 餘額：{balance}"
+            "📊 本群統計\n"
+            f"前數：{fmt2(st['front'])}\n"
+            f"手動：{fmt2(st['manual'])}\n"
+            f"回數：{fmt2(st['ret'])}\n"
+            "—\n"
+            f"💰 餘額：{fmt2(balance)}"
         )
         return {"ok": True}
 
+    # 清空
     if text == "清空":
         st["front"] = st["manual"] = st["ret"] = 0.0
         add_log(chat_id, chat_name, user, "清空", 0.0)
@@ -230,15 +247,16 @@ async def telegram_webhook(request: Request):
         await tg_send_message(chat_id, "🧹 已清空（前數/手動/回數）")
         return {"ok": True}
 
-   if text == "匯出":
-    if not PUBLIC_BASE_URL:
-        await tg_send_message(chat_id, "⚠️ 尚未設定 PUBLIC_BASE_URL")
+    # 匯出（只回一行網址，key 留空讓你自己輸入）
+    if text == "匯出":
+        if not PUBLIC_BASE_URL:
+            await tg_send_message(chat_id, "⚠️ 尚未設定 PUBLIC_BASE_URL")
+            return {"ok": True}
+
+        url = f"{PUBLIC_BASE_URL}/admin?chat_id={chat_id}&key="
+        await tg_send_message(chat_id, url)
         return {"ok": True}
 
-    # 只回一行網址，讓你自己輸入 key
-    url = f"{PUBLIC_BASE_URL}/admin?chat_id={chat_id}&key="
-
-    await tg_send_message(chat_id, url)
     return {"ok": True}
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -386,4 +404,3 @@ async def setup_webhook(key: str):
             raise HTTPException(status_code=500, detail=str(data))
 
     return RedirectResponse(url=f"/admin?key={key}")
-
