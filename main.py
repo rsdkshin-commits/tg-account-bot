@@ -1,4 +1,4 @@
-import os, json, re
+import os, json
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
@@ -22,6 +22,8 @@ if not TELEGRAM_TOKEN:
 
 os.makedirs(DATA_DIR, exist_ok=True)
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
+
+TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 # ---------------- Data ----------------
 def load_db() -> Dict[str, Any]:
@@ -49,11 +51,11 @@ def get_chat(chat_id: int) -> Dict[str, Any]:
     return chats[cid]
 
 def add_log(chat_id: int, chat_name: str, user: str, kind: str, amount: float):
-    chat = get_chat(chat_id)
-    chat["logs"].append({
+    st = get_chat(chat_id)
+    st["logs"].append({
         "time": datetime.now().isoformat(timespec="seconds"),
         "user": user,
-        "kind": kind,     # 前數 / 手動 / 回數 / 重置
+        "kind": kind,     # 前數 / 手動 / 回數 / 清空
         "amount": amount,
         "chat_id": chat_id,
         "chat_name": chat_name,
@@ -68,25 +70,38 @@ def parse_iso(t: str) -> Optional[datetime]:
 
 DB = load_db()
 
-# ---------------- Telegram API helpers ----------------
-TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-
+# ---------------- Helpers ----------------
 async def tg_send_message(chat_id: int, text: str):
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(f"{TG_API}/sendMessage", json={
-            "chat_id": chat_id,
-            "text": text
-        })
+        r = await client.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": text})
         data = r.json()
         if not data.get("ok"):
             raise RuntimeError(str(data))
 
+def require_admin(key: str):
+    if not ADMIN_KEY or key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+def parse_dt(s: str) -> datetime:
+    """Support:
+    1) YYYY-MM-DD HH:MM:SS
+    2) YYYY-MM-DDTHH:MM
+    3) YYYY-MM-DDTHH:MM:SS
+    """
+    s = (s or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            pass
+    raise ValueError("Bad datetime format")
+
 # ---------------- Excel export (含餘額) ----------------
 def export_excel(chat_id: int, start_dt: datetime, end_dt: datetime) -> Optional[str]:
-    chat = get_chat(chat_id)
+    st = get_chat(chat_id)
 
     parsed: List[tuple[datetime, Dict[str, Any]]] = []
-    for log in chat.get("logs", []):
+    for log in st.get("logs", []):
         t = parse_iso(log.get("time", ""))
         if t:
             parsed.append((t, log))
@@ -107,7 +122,7 @@ def export_excel(chat_id: int, start_dt: datetime, end_dt: datetime) -> Optional
             running_manual += amount
         elif kind == "回數":
             running_ret += amount
-        elif kind == "重置":
+        elif kind == "清空":
             running_front = running_manual = running_ret = 0.0
 
         balance = running_front + running_manual - running_ret
@@ -131,10 +146,6 @@ def export_excel(chat_id: int, start_dt: datetime, end_dt: datetime) -> Optional
     df.to_excel(path, index=False)
     return path
 
-def require_admin(key: str):
-    if not ADMIN_KEY or key != ADMIN_KEY:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
 # ---------------- FastAPI ----------------
 app = FastAPI()
 
@@ -144,14 +155,13 @@ async def root():
 
 @app.post(f"/telegram/{WEBHOOK_PATH_SECRET}")
 async def telegram_webhook(request: Request):
-    # 1) 驗證 Telegram secret token header（如果你有設定）
+    # Verify Telegram secret token header if set
     if WEBHOOK_SECRET_TOKEN:
         got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         if got != WEBHOOK_SECRET_TOKEN:
             raise HTTPException(status_code=403, detail="Bad secret token")
 
     payload = await request.json()
-
     msg = payload.get("message") or payload.get("edited_message")
     if not msg:
         return {"ok": True}
@@ -169,7 +179,6 @@ async def telegram_webhook(request: Request):
 
     st = get_chat(chat_id)
 
-    # 指令解析
     def parse_amount(prefix: str) -> Optional[float]:
         try:
             return float(text[len(prefix):].strip())
@@ -216,7 +225,7 @@ async def telegram_webhook(request: Request):
 
     if text == "清空":
         st["front"] = st["manual"] = st["ret"] = 0.0
-        add_log(chat_id, chat_name, user, "重置", 0.0)
+        add_log(chat_id, chat_name, user, "清空", 0.0)
         save_db()
         await tg_send_message(chat_id, "🧹 已清空（前數/手動/回數）")
         return {"ok": True}
@@ -226,58 +235,145 @@ async def telegram_webhook(request: Request):
             await tg_send_message(chat_id, "⚠️ 尚未設定 PUBLIC_BASE_URL（請到 Render Environment 填入你的網址）")
             return {"ok": True}
 
+        # 不帶 key（你要自己輸入 ADMIN_KEY）
+        # 這裡提供：
+        # 1) 後台網址（可手選日期時間）
+        # 2) 直接下載網址（預設過去30天）
         end_dt = datetime.now()
         start_dt = end_dt - timedelta(days=30)
-        url = (
+
+        admin_url_no_key = f"{PUBLIC_BASE_URL}/admin?chat_id={chat_id}"
+        download_url_no_key = (
             f"{PUBLIC_BASE_URL}/admin/export?"
-            f"key={ADMIN_KEY}&chat_id={chat_id}"
+            f"chat_id={chat_id}"
             f"&start={start_dt.strftime('%Y-%m-%d %H:%M:%S')}"
             f"&end={end_dt.strftime('%Y-%m-%d %H:%M:%S')}"
         )
-        await tg_send_message(chat_id, f"📄 下載 Excel（含餘額）：\n{url}")
+
+        await tg_send_message(
+            chat_id,
+            "🖥 後台（可手選日期/時間到秒）\n"
+            f"{admin_url_no_key}\n\n"
+            "📄 直接下載（預設過去30天）\n"
+            f"{download_url_no_key}\n\n"
+            "🔐 以上網址都需要你自己加上 key：\n"
+            "後台：在網址最後加 &key=你的ADMIN_KEY\n"
+            "下載：在網址最後加 &key=你的ADMIN_KEY"
+        )
         return {"ok": True}
 
     return {"ok": True}
 
 @app.get("/admin", response_class=HTMLResponse)
-async def admin_home(key: str):
+async def admin_home(key: str, chat_id: Optional[int] = None):
     require_admin(key)
+
     chats = DB.get("chats", {})
     options = []
     for cid, obj in chats.items():
         name = obj.get("logs", [{}])[-1].get("chat_name", cid) if obj.get("logs") else cid
-        options.append(f"<option value='{cid}'>{cid} - {name}</option>")
+        sel = "selected" if (chat_id is not None and str(chat_id) == cid) else ""
+        options.append(f"<option value='{cid}' {sel}>{cid} - {name}</option>")
 
     html = f"""
-    <html><head><meta charset="utf-8"><title>Telegram 記帳後台</title></head>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Telegram 記帳後台</title>
+    </head>
     <body style="font-family:Arial; padding:20px;">
       <h2>Telegram 記帳後台</h2>
       <p>資料檔：<code>{DATA_FILE}</code></p>
 
-      <p><a href="/setup-webhook?key={key}">✅ 設定 Webhook（首次部署點一次）</a></p>
+      <p>
+        <a href="/setup-webhook?key={key}">✅ 設定 Webhook（首次部署點一次）</a>
+      </p>
 
       <h3>下載 Excel（含餘額）</h3>
+
+      <div style="margin:10px 0;">
+        <button type="button" onclick="setRange('today')">今天</button>
+        <button type="button" onclick="setRange('yesterday')">昨天</button>
+        <button type="button" onclick="setRange('last7')">過去7天</button>
+        <button type="button" onclick="setRange('last30')">過去30天</button>
+        <button type="button" onclick="setRange('thisMonth')">本月</button>
+        <button type="button" onclick="setRange('lastMonth')">上月</button>
+      </div>
+
       <form method="get" action="/admin/export">
         <input type="hidden" name="key" value="{key}">
+
         <div>
           <label>Chat：</label>
-          <select name="chat_id" required>
+          <select name="chat_id" id="chat_id" required>
             {''.join(options)}
           </select>
         </div>
+
         <div style="margin-top:10px;">
-          <label>開始（YYYY-MM-DD HH:MM:SS）：</label>
-          <input name="start" style="width:220px;" placeholder="2026-02-01 00:00:00" required>
+          <label>開始：</label>
+          <input type="datetime-local" step="1" id="start_dt" name="start" required>
+          <small>（可到秒）</small>
         </div>
+
         <div style="margin-top:10px;">
-          <label>結束（YYYY-MM-DD HH:MM:SS）：</label>
-          <input name="end" style="width:220px;" placeholder="2026-02-27 23:59:59" required>
+          <label>結束：</label>
+          <input type="datetime-local" step="1" id="end_dt" name="end" required>
+          <small>（可到秒）</small>
         </div>
+
         <div style="margin-top:15px;">
           <button type="submit">下載</button>
         </div>
       </form>
-    </body></html>
+
+      <script>
+      function pad(n) {{ return String(n).padStart(2,'0'); }}
+      function toLocalInputValue(d) {{
+        return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate()) +
+               'T' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+      }}
+
+      function setRange(kind) {{
+        const now = new Date();
+        let start, end;
+
+        if (kind === 'today') {{
+          start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0,0,0);
+          end   = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23,59,59);
+        }} else if (kind === 'yesterday') {{
+          const y = new Date(now);
+          y.setDate(y.getDate()-1);
+          start = new Date(y.getFullYear(), y.getMonth(), y.getDate(), 0,0,0);
+          end   = new Date(y.getFullYear(), y.getMonth(), y.getDate(), 23,59,59);
+        }} else if (kind === 'last7') {{
+          end = new Date(now);
+          start = new Date(now);
+          start.setDate(start.getDate()-7);
+        }} else if (kind === 'last30') {{
+          end = new Date(now);
+          start = new Date(now);
+          start.setDate(start.getDate()-30);
+        }} else if (kind === 'thisMonth') {{
+          start = new Date(now.getFullYear(), now.getMonth(), 1, 0,0,0);
+          end = new Date(now);
+        }} else if (kind === 'lastMonth') {{
+          const firstThis = new Date(now.getFullYear(), now.getMonth(), 1, 0,0,0);
+          const lastPrev = new Date(firstThis.getTime() - 1000);
+          start = new Date(lastPrev.getFullYear(), lastPrev.getMonth(), 1, 0,0,0);
+          end = new Date(lastPrev.getFullYear(), lastPrev.getMonth(), lastPrev.getDate(), 23,59,59);
+        }}
+
+        document.getElementById('start_dt').value = toLocalInputValue(start);
+        document.getElementById('end_dt').value = toLocalInputValue(end);
+      }}
+
+      // 預設過去30天
+      setRange('last30');
+      </script>
+
+    </body>
+    </html>
     """
     return HTMLResponse(html)
 
@@ -285,8 +381,8 @@ async def admin_home(key: str):
 async def admin_export(key: str, chat_id: int, start: str, end: str):
     require_admin(key)
     try:
-        start_dt = datetime.strptime(start, "%Y-%m-%d %H:%M:%S")
-        end_dt = datetime.strptime(end, "%Y-%m-%d %H:%M:%S")
+        start_dt = parse_dt(start)
+        end_dt = parse_dt(end)
     except ValueError:
         raise HTTPException(status_code=400, detail="Bad datetime format")
 
