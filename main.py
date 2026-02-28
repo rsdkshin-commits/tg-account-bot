@@ -248,17 +248,17 @@ async def telegram_webhook(request: Request):
         return {"ok": True}
 
     if text == "狀態":
-    balance = round(float(st["front"]) + float(st["manual"]) - float(st["ret"]), 2)
-    await tg_send_message(
-        chat_id,
-        "📌 目前狀態\n"
-        f"前數：{st['front']:.2f}\n"
-        f"手動：{st['manual']:.2f}\n"
-        f"回數：{st['ret']:.2f}\n"
-        f"餘額：{balance:.2f}\n"
-        f"DATA_FILE：{DATA_FILE}"
-    )
-    return {"ok": True}
+        balance = round(float(st["front"]) + float(st["manual"]) - float(st["ret"]), 2)
+        await tg_send_message(
+            chat_id,
+            "📌 目前狀態\n"
+            f"前數：{st['front']:.2f}\n"
+            f"手動：{st['manual']:.2f}\n"
+            f"回數：{st['ret']:.2f}\n"
+            f"餘額：{balance:.2f}\n"
+            f"DATA_FILE：{DATA_FILE}"
+        )
+        return {"ok": True}
     
     # 匯出（只回一行網址，key 留空讓你自己輸入）
     if text == "匯出":
@@ -269,8 +269,6 @@ async def telegram_webhook(request: Request):
         url = f"{PUBLIC_BASE_URL}/admin?chat_id={chat_id}&key="
         await tg_send_message(chat_id, url)
         return {"ok": True}
-
-    return {"ok": True}
 
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_home(key: str, chat_id: Optional[int] = None):
@@ -417,4 +415,5 @@ async def setup_webhook(key: str):
             raise HTTPException(status_code=500, detail=str(data))
 
     return RedirectResponse(url=f"/admin?key={key}")
+
 
