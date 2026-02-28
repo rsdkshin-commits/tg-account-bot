@@ -32,12 +32,21 @@ def load_db() -> Dict[str, Any]:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
-            pass
+            # JSON 壞了就先備份，不要直接當成空資料覆蓋回去
+            try:
+                bad_name = DATA_FILE + ".corrupt." + datetime.now().strftime("%Y%m%d_%H%M%S")
+                os.replace(DATA_FILE, bad_name)
+            except Exception:
+                pass
     return {"chats": {}}
 
 def save_db():
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
+    tmp = DATA_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(DB, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, DATA_FILE)  # 原子替換，避免寫到一半中斷
 
 def get_chat(chat_id: int) -> Dict[str, Any]:
     cid = str(chat_id)
@@ -429,6 +438,7 @@ async def setup_webhook(key: str):
             raise HTTPException(status_code=500, detail=str(data))
 
     return RedirectResponse(url=f"/admin?key={key}")
+
 
 
 
