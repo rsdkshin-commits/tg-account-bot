@@ -12,7 +12,7 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
-DATA_DIR = os.getenv("DATA_DIR", ".")  # Render: /var/data
+DATA_DIR = os.getenv("DATA_DIR", "/var/data")  # Render: /var/data
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 WEBHOOK_PATH_SECRET = os.getenv("WEBHOOK_PATH_SECRET", "hook")
 WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "")
@@ -247,6 +247,19 @@ async def telegram_webhook(request: Request):
         await tg_send_message(chat_id, "🧹 已清空（前數/手動/回數）")
         return {"ok": True}
 
+    if text == "狀態":
+    balance = round(float(st["front"]) + float(st["manual"]) - float(st["ret"]), 2)
+    await tg_send_message(
+        chat_id,
+        "📌 目前狀態\n"
+        f"前數：{st['front']:.2f}\n"
+        f"手動：{st['manual']:.2f}\n"
+        f"回數：{st['ret']:.2f}\n"
+        f"餘額：{balance:.2f}\n"
+        f"DATA_FILE：{DATA_FILE}"
+    )
+    return {"ok": True}
+    
     # 匯出（只回一行網址，key 留空讓你自己輸入）
     if text == "匯出":
         if not PUBLIC_BASE_URL:
@@ -404,3 +417,4 @@ async def setup_webhook(key: str):
             raise HTTPException(status_code=500, detail=str(data))
 
     return RedirectResponse(url=f"/admin?key={key}")
+
