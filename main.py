@@ -261,18 +261,18 @@ async def telegram_webhook(request: Request):
         return {"ok": True}
     
     if text == "查清空":
-    logs = st.get("logs", [])
-    clears = [x for x in logs if str(x.get("kind")) == "清空"]
-    clears = clears[-5:]
-    if not clears:
-        await tg_send_message(chat_id, "✅ 目前沒有清空紀錄")
-        return {"ok": True}
+        logs = st.get("logs", [])
+        clears = [x for x in logs if str(x.get("kind")) == "清空"]
+        clears = clears[-5:]
+        if not clears:
+            await tg_send_message(chat_id, "✅ 目前沒有清空紀錄")
+            return {"ok": True}
 
-    lines = ["🧾 最近清空紀錄（最多5筆）"]
-    for x in clears:
-        lines.append(f"{x.get('time')} / {x.get('user')} / {x.get('chat_name')}")
-    await tg_send_message(chat_id, "\n".join(lines))
-    return {"ok": True}
+        lines = ["🧾 最近清空紀錄（最多5筆）"]
+        for x in clears:
+            lines.append(f"{x.get('time')} / {x.get('user')} / {x.get('chat_name')}")
+        await tg_send_message(chat_id, "\n".join(lines))
+        return {"ok": True}
     
     # 匯出（只回一行網址，key 留空讓你自己輸入）
     if text == "匯出":
@@ -429,6 +429,7 @@ async def setup_webhook(key: str):
             raise HTTPException(status_code=500, detail=str(data))
 
     return RedirectResponse(url=f"/admin?key={key}")
+
 
 
 
