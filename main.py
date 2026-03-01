@@ -175,7 +175,38 @@ async def telegram_webhook(request: Request):
             raise HTTPException(status_code=403, detail="Bad secret token")
 
     payload = await request.json()
+    # ---- Dedupe Telegram updates (防止重複紀錄) ----
+    update_id = int(payload.get("update_id") or 0)
+    last_id = int(DB.get("last_update_id") or 0)
+
+    # Telegram 可能重送舊 update，直接忽略
+    if update_id and update_id <= last_id:
+        return {"ok": True}
+
+    # 先更新 last_update_id（再處理訊息），避免同 update 重進來
+    if update_id:
+        DB["last_update_id"] = update_id
+        save_db()
     msg = payload.get("message") or payload.get("edited_message")
+        # ---- Extra dedupe by chat_id + message_id ----
+    chat = msg.get("chat", {})
+    chat_id = int(chat.get("id"))
+    message_id = int(msg.get("message_id") or 0)
+
+    seen = DB.setdefault("seen_msgs", {})  # { "chatid:msgid": "time" }
+    key = f"{chat_id}:{message_id}"
+    if message_id and key in seen:
+        return {"ok": True}
+
+    if message_id:
+        seen[key] = datetime.now().isoformat(timespec="seconds")
+        # 控制 seen_msgs 大小，避免無限增長（保留最近 5000 筆）
+        if len(seen) > 10000:
+            # 刪最舊的 1000 筆（簡單做法）
+            for k in list(seen.keys())[:1000]:
+                seen.pop(k, None)
+        save_db()
+        
     if not msg:
         return {"ok": True}
 
@@ -438,6 +469,7 @@ async def setup_webhook(key: str):
             raise HTTPException(status_code=500, detail=str(data))
 
     return RedirectResponse(url=f"/admin?key={key}")
+
 
 
 
