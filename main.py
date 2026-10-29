@@ -2,6 +2,8 @@ import os
 import json
 import asyncio
 import traceback
+import random
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -91,7 +93,7 @@ def parse_iso_any(t: str) -> Optional[datetime]:
         return None
 
 
-def add_log(chat_id: int, chat_name: str, user: str, kind: str, amount: float):
+def add_log(chat_id: int, chat_name: str, user: str, kind: str, amount: float, message_id: int = 0):
     st = get_chat(chat_id)
     st["logs"].append(
         {
@@ -103,6 +105,9 @@ def add_log(chat_id: int, chat_name: str, user: str, kind: str, amount: float):
             "chat_name": chat_name,
         }
     )
+    if message_id:
+        seen = DB.setdefault("seen_msgs", {})
+        seen[f"{chat_id}:{message_id}"] = datetime.now(UTC8).isoformat(timespec="seconds")
     save_db()
 
 
@@ -134,34 +139,69 @@ def parse_dt_to_utc8(s: str) -> datetime:
     raise ValueError("Bad datetime format")
 
 
-async def tg_send_message(chat_id: int, text: str):
-    """
-    重點：
-    - 不要 raise（避免 webhook 500）
-    - 連線抖動時重試
-    """
-    payload = {"chat_id": chat_id, "text": text}
-    delays = [0.0, 0.5, 1.0, 2.0]  # 4 次
+# Outbox is persisted before acknowledging the webhook.
+# Keep one worker and one Uvicorn process when using this JSON storage.
+OUTBOX_MAX = 20000
+send_wakeup = asyncio.Event()
+write_lock = asyncio.Lock()
 
-    for i, d in enumerate(delays):
-        if d:
-            await asyncio.sleep(d)
-        try:
-            timeout = httpx.Timeout(10.0, connect=5.0)
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                r = await client.post(f"{TG_API}/sendMessage", json=payload)
-                data = r.json()
-                if data.get("ok"):
-                    return
-                # Telegram 回 not ok 也不要炸 webhook
-                print("sendMessage not ok:", data)
-                return
-        except Exception as e:
-            # 最後一次才印
-            if i == len(delays) - 1:
-                print("sendMessage failed:", repr(e))
-            continue
-    return
+async def tg_send_message(chat_id: int, text: str):
+    """Queue a Telegram reply durably; never wait for Telegram in webhook."""
+    outbox = DB.setdefault("outbox", [])
+    if len(outbox) >= OUTBOX_MAX:
+        raise RuntimeError("Outbox full: refusing to ACK update")
+    next_id = int(DB.setdefault("meta", {}).get("outbox_seq", 0)) + 1
+    DB["meta"]["outbox_seq"] = next_id
+    outbox.append({"id": next_id, "chat_id": chat_id, "text": text,
+                   "attempts": 0, "next_at": 0, "created": datetime.now(UTC8).isoformat()})
+    save_db()
+    send_wakeup.set()
+
+async def send_worker():
+    limits = httpx.Limits(max_connections=5, max_keepalive_connections=5)
+    timeout = httpx.Timeout(20.0, connect=8.0)
+    async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
+        while True:
+            try:
+                now = time.time()
+                items = DB.setdefault("outbox", [])
+                item = next((x for x in items if x.get("next_at", 0) <= now), None)
+                if item is None:
+                    send_wakeup.clear()
+                    earliest = min((x.get("next_at", 0) for x in items), default=None)
+                    delay = max(0.2, min(10.0, earliest - now)) if earliest is not None else 10.0
+                    try:
+                        await asyncio.wait_for(send_wakeup.wait(), timeout=delay)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+                try:
+                    r = await client.post(f"{TG_API}/sendMessage", json={"chat_id": item["chat_id"], "text": item["text"]})
+                    data = r.json()
+                    if data.get("ok"):
+                        items.remove(item)
+                        save_db()
+                        continue
+                    code = data.get("error_code", r.status_code)
+                    if code in (400, 401, 403, 404):
+                        DB.setdefault("failed_outbox", []).append({**item, "error": str(data)[:500]})
+                        items.remove(item)
+                        save_db()
+                        print("sendMessage permanent failure:", code, flush=True)
+                        continue
+                    retry_after = (data.get("parameters") or {}).get("retry_after", 0)
+                    print("sendMessage temporary API error:", code, flush=True)
+                except (httpx.TimeoutException, httpx.NetworkError, ValueError) as exc:
+                    retry_after = 0
+                    print("sendMessage retry:", type(exc).__name__, flush=True)
+                item["attempts"] = item.get("attempts", 0) + 1
+                item["next_at"] = time.time() + max(float(retry_after or 0), min(300, 2 ** min(8, item["attempts"])))
+                save_db()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                print("OUTBOX WORKER ERROR:", traceback.format_exc(), flush=True)
+                await asyncio.sleep(2)
 
 
 def record_last_error(err: Exception):
@@ -258,6 +298,8 @@ async def health():
         "time_utc8": datetime.now(UTC8).isoformat(timespec="seconds"),
         "data_file": DATA_FILE,
         "chats_count": len(chats),
+        "outbox_pending": len(DB.get("outbox", [])),
+        "outbox_failed": len(DB.get("failed_outbox", [])),
         "has_last_error": bool(last_err),
         "last_error_time": (last_err or {}).get("time"),
     }
@@ -283,31 +325,32 @@ async def debug_last_error(key: str):
 
 
 def _dedupe_by_message(chat_id: int, message_id: int) -> bool:
-    """
-    True = 已處理過（要忽略）
-    False = 沒處理過（可處理並記錄）
-    """
-    if not message_id:
-        return False
+    """Only check here. Mark as processed WITH the financial transaction."""
+    return bool(message_id and f"{chat_id}:{message_id}" in DB.setdefault("seen_msgs", {}))
 
-    seen: Dict[str, str] = DB.setdefault("seen_msgs", {})
-    k = f"{chat_id}:{message_id}"
-    if k in seen:
-        return True
 
-    seen[k] = datetime.now(UTC8).isoformat(timespec="seconds")
+@app.on_event("startup")
+async def start_send_worker():
+    app.state.sender_task = asyncio.create_task(send_worker())
 
-    # 控制大小，避免無限增長
-    if len(seen) > 10000:
-        for kk in list(seen.keys())[:2000]:
-            seen.pop(kk, None)
 
-    save_db()
-    return False
+@app.on_event("shutdown")
+async def stop_send_worker():
+    app.state.sender_task.cancel()
+    try:
+        await app.state.sender_task
+    except asyncio.CancelledError:
+        pass
 
 
 @app.post(f"/telegram/{WEBHOOK_PATH_SECRET}")
 async def telegram_webhook(request: Request):
+    # Serializes updates in one process, preventing double application of retries.
+    async with write_lock:
+        return await process_webhook(request)
+
+
+async def process_webhook(request: Request):
     # ✅ 永遠不要讓 webhook 回 500（避免漏收/重送/重複）
     try:
         # Verify Telegram secret token header if set
@@ -355,7 +398,7 @@ async def telegram_webhook(request: Request):
                 return {"ok": True}
 
             st["front"] = round(float(st["front"]) + float(amount), 2)
-            add_log(chat_id, chat_name, user, "前數", amount)
+            add_log(chat_id, chat_name, user, "前數", amount, message_id)
             await tg_send_message(chat_id, f"✅ 前數={fmt2(st['front'])}")
             return {"ok": True}
 
@@ -367,7 +410,7 @@ async def telegram_webhook(request: Request):
                 return {"ok": True}
 
             st["manual"] = round(float(st["manual"]) + float(amount), 2)
-            add_log(chat_id, chat_name, user, "手動", amount)
+            add_log(chat_id, chat_name, user, "手動", amount, message_id)
             await tg_send_message(chat_id, f"✅ 手動={fmt2(st['manual'])}")
             return {"ok": True}
 
@@ -379,7 +422,7 @@ async def telegram_webhook(request: Request):
                 return {"ok": True}
 
             st["ret"] = round(float(st["ret"]) + float(amount), 2)
-            add_log(chat_id, chat_name, user, "回數", amount)
+            add_log(chat_id, chat_name, user, "回數", amount, message_id)
             await tg_send_message(chat_id, f"✅ 回數={fmt2(st['ret'])}")
             return {"ok": True}
 
@@ -400,7 +443,7 @@ async def telegram_webhook(request: Request):
         # 清空
         if text == "清空":
             st["front"] = st["manual"] = st["ret"] = 0.0
-            add_log(chat_id, chat_name, user, "清空", 0.0)
+            add_log(chat_id, chat_name, user, "清空", 0.0, message_id)
             save_db()
             await tg_send_message(chat_id, "🧹 已清空（前數/手動/回數）")
             return {"ok": True}
@@ -451,7 +494,7 @@ async def telegram_webhook(request: Request):
         print("WEBHOOK ERROR:", repr(e))
         print(traceback.format_exc())
         record_last_error(e)
-        return {"ok": True}
+        raise HTTPException(status_code=503, detail="Temporary processing error; retry update")
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -597,7 +640,7 @@ async def setup_webhook(key: str):
         raise HTTPException(status_code=400, detail="Missing PUBLIC_BASE_URL")
 
     webhook_url = f"{PUBLIC_BASE_URL}/telegram/{WEBHOOK_PATH_SECRET}"
-    payload: Dict[str, Any] = {"url": webhook_url}
+    payload: Dict[str, Any] = {"url": webhook_url, "max_connections": 5, "drop_pending_updates": False}
     if WEBHOOK_SECRET_TOKEN:
         payload["secret_token"] = WEBHOOK_SECRET_TOKEN
 
